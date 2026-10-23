@@ -169,12 +169,16 @@ final class IOSFilePickerHandler: NSObject,
 
         eventSink?(true)
         loader.loadMedia(results, preferringCompatible: preferringCompatible) {
-            [weak self] loaded in
+            [weak self] loaded, failures in
             guard let self else {
                 return
             }
             eventSink?(false)
-            complete(currentResult, pickedCount: results.count, loaded: loaded)
+            complete(
+                currentResult,
+                pickedCount: results.count,
+                loaded: loaded,
+                failures: failures)
             result = nil
         }
     }
@@ -242,17 +246,23 @@ final class IOSFilePickerHandler: NSObject,
             return
         }
 
-        let loaded = loader.loadDocuments(urls)
-        complete(currentResult, pickedCount: urls.count, loaded: loaded)
+        let documents = loader.loadDocuments(urls)
+        complete(
+            currentResult,
+            pickedCount: urls.count,
+            loaded: documents.loaded,
+            failures: documents.failures)
         result = nil
     }
 
     /// Completes a pick of `pickedCount` items with the ones that could be
-    /// `loaded`, following `PickOutcome`.
+    /// `loaded`, following `PickOutcome`. `failures` holds why the others
+    /// could not be, where an error was available.
     private func complete(
         _ currentResult: FlutterResult,
         pickedCount: Int,
-        loaded: [[String: Any]]
+        loaded: [[String: Any]],
+        failures: [LoadFailure] = []
     ) {
         switch PickOutcome.resolve(pickedCount: pickedCount, loaded: loaded) {
         case .cancelled:
@@ -260,19 +270,23 @@ final class IOSFilePickerHandler: NSObject,
         case .loaded(let items):
             currentResult(items)
         case .loadFailed:
-            currentResult(loadFailedError())
+            currentResult(loadFailedError(failures))
         }
     }
 
     /// The error for a pick where the user picked at least one item but none
     /// could be loaded, for example photos only stored in iCloud while the
-    /// device is offline. Completing with `nil` instead would look like a
-    /// cancellation to the app.
-    private func loadFailedError() -> FlutterError {
+    /// device is offline, or a device with no space left for the copy.
+    /// Completing with `nil` instead would look like a cancellation to the app.
+    ///
+    /// `details` lists one `LoadFailure.details` map per item that failed with
+    /// an error, in pick order, so the app can tell those causes apart. It is
+    /// empty when no error was available, for example with `copyMedia: false`.
+    private func loadFailedError(_ failures: [LoadFailure]) -> FlutterError {
         FlutterError(
             code: "load_failed",
             message: "None of the picked items could be loaded.",
-            details: nil)
+            details: failures.sorted { $0.index < $1.index }.map(\.details))
     }
 
     private func presentMediaPicker(type: String, allowsMultipleSelection: Bool) {
@@ -441,10 +455,10 @@ extension PHPickerResult: PickedMediaItem {
 
     func loadFile(
         forTypeIdentifier typeIdentifier: String,
-        completion: @escaping (URL?) -> Void
+        completion: @escaping (URL?, Error?) -> Void
     ) {
-        itemProvider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, _ in
-            completion(url)
+        itemProvider.loadFileRepresentation(forTypeIdentifier: typeIdentifier) { url, error in
+            completion(url, error)
         }
     }
 }

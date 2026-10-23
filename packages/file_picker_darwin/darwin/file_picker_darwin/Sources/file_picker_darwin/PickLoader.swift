@@ -14,12 +14,12 @@ protocol PickedMediaItem {
     /// registered them.
     var registeredTypeIdentifiers: [String] { get }
     /// Loads the item as a file of the given type, calling `completion` with
-    /// its URL, or `nil` if it could not be loaded. The file may be deleted
-    /// as soon as `completion` returns, and `completion` may be called on any
-    /// queue.
+    /// its URL, or with `nil` and the error if it could not be loaded. The
+    /// file may be deleted as soon as `completion` returns, and `completion`
+    /// may be called on any queue.
     func loadFile(
         forTypeIdentifier typeIdentifier: String,
-        completion: @escaping (URL?) -> Void)
+        completion: @escaping (URL?, Error?) -> Void)
 }
 
 /// Turns picked items into the file descriptions sent back to Dart.
@@ -31,7 +31,8 @@ struct PickLoader {
     var temporaryDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
 
     /// Loads and copies each of `items`, then calls `completion` on `queue`
-    /// with the ones that loaded, in the order of `items`.
+    /// with the ones that loaded, in the order of `items`, and why the others
+    /// could not be.
     ///
     /// The items load concurrently and may finish in any order, so the
     /// results are collected by index rather than appended as they arrive.
@@ -39,10 +40,11 @@ struct PickLoader {
         _ items: [PickedMediaItem],
         preferringCompatible: Bool,
         queue: DispatchQueue = .main,
-        completion: @escaping ([[String: Any]]) -> Void
+        completion: @escaping ([[String: Any]], [LoadFailure]) -> Void
     ) {
         let group = DispatchGroup()
         var resolved = [[String: Any]?](repeating: nil, count: items.count)
+        var failures: [LoadFailure] = []
         let resolvedLock = NSLock()
 
         for (index, item) in items.enumerated() {
@@ -53,39 +55,53 @@ struct PickLoader {
             let typeIdentifier = MediaRepresentation.typeIdentifier(
                 for: item.registeredTypeIdentifiers,
                 preferringCompatible: preferringCompatible)
-            item.loadFile(forTypeIdentifier: typeIdentifier) { url in
+            item.loadFile(forTypeIdentifier: typeIdentifier) { url, error in
                 defer { group.leave() }
-                // The file may be deleted when this returns, so it has to be
-                // copied.
-                guard let url,
-                      let copiedURL = store(url, copying: true),
-                      var info = fileInfo(for: copiedURL)
-                else {
-                    return
+                do {
+                    // Should `url` be missing without an error, still report a
+                    // failure rather than nothing.
+                    guard let url else {
+                        throw error ?? CocoaError(.fileReadUnknown)
+                    }
+                    // The file may be deleted when this returns, so it has to
+                    // be copied.
+                    var info = try fileInfo(for: store(url, copying: true))
+                    if let assetIdentifier = item.assetIdentifier {
+                        info["assetIdentifier"] = assetIdentifier
+                    }
+                    resolvedLock.lock()
+                    resolved[index] = info
+                    resolvedLock.unlock()
+                } catch {
+                    resolvedLock.lock()
+                    failures.append(LoadFailure(index: index, error: error))
+                    resolvedLock.unlock()
                 }
-                if let assetIdentifier = item.assetIdentifier {
-                    info["assetIdentifier"] = assetIdentifier
-                }
-                resolvedLock.lock()
-                resolved[index] = info
-                resolvedLock.unlock()
             }
         }
 
         group.notify(queue: queue) {
-            completion(resolved.compactMap { $0 })
+            completion(resolved.compactMap { $0 }, failures)
         }
     }
 
     /// Moves each of the document picker's `urls` into its own temporary
-    /// subdirectory and describes the ones that could be moved.
+    /// subdirectory, and describes the ones that could be moved and why the
+    /// others could not be.
     ///
     /// The picker opens with `asCopy`, so each file is already a copy the app
     /// owns, and moving it avoids storing it twice (#2261).
-    func loadDocuments(_ urls: [URL]) -> [[String: Any]] {
-        urls.compactMap { url in
-            store(url, copying: false).flatMap(fileInfo(for:))
+    func loadDocuments(_ urls: [URL]) -> (loaded: [[String: Any]], failures: [LoadFailure]) {
+        var loaded: [[String: Any]] = []
+        var failures: [LoadFailure] = []
+        for (index, url) in urls.enumerated() {
+            do {
+                loaded.append(try fileInfo(for: store(url, copying: false)))
+            } catch {
+                failures.append(LoadFailure(index: index, error: error))
+            }
         }
+        return (loaded, failures)
     }
 
     /// Describes a picked photo library asset without copying it, by its
@@ -151,42 +167,37 @@ struct PickLoader {
     /// Giving each item its own directory removes the shared destination, so
     /// the copies can no longer observe or delete each other. The existence
     /// check is gone with it, the directory is new every time.
-    func store(_ sourceURL: URL, copying: Bool) -> URL? {
+    ///
+    /// Throws the file system error, such as a full disk, so the pick can
+    /// report why the item could not be loaded.
+    func store(_ sourceURL: URL, copying: Bool) throws -> URL {
         let directoryURL = temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
         let destinationURL = directoryURL
             .appendingPathComponent(sourceURL.lastPathComponent)
 
-        do {
-            try FileManager.default.createDirectory(
-                at: directoryURL,
-                withIntermediateDirectories: true
-            )
-            if copying {
-                try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
-            } else {
-                try FileManager.default.moveItem(at: sourceURL, to: destinationURL)
-            }
-            return destinationURL
-        } catch {
-            return nil
+        try FileManager.default.createDirectory(
+            at: directoryURL,
+            withIntermediateDirectories: true
+        )
+        if copying {
+            try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+        } else {
+            try FileManager.default.moveItem(at: sourceURL, to: destinationURL)
         }
+        return destinationURL
     }
 
     /// Describes a stored file for Dart.
-    func fileInfo(for fileURL: URL) -> [String: Any]? {
-        do {
-            let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
-            let size = values.fileSize ?? 0
+    func fileInfo(for fileURL: URL) throws -> [String: Any] {
+        let values = try fileURL.resourceValues(forKeys: [.fileSizeKey])
+        let size = values.fileSize ?? 0
 
-            return [
-                "path": fileURL.path,
-                "identifier": fileURL.absoluteString,
-                "name": fileURL.lastPathComponent,
-                "size": size,
-            ]
-        } catch {
-            return nil
-        }
+        return [
+            "path": fileURL.path,
+            "identifier": fileURL.absoluteString,
+            "name": fileURL.lastPathComponent,
+            "size": size,
+        ]
     }
 }

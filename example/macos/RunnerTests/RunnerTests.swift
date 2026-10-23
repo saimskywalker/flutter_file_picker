@@ -48,6 +48,64 @@ struct PickOutcomeTests {
     }
 }
 
+@Suite("LoadFailure")
+struct LoadFailureTests {
+    // An error shaped like the photo picker's: a generic description, with
+    // the specific cause in the errors underneath it.
+    static let outOfSpace = NSError(
+        domain: NSItemProvider.errorDomain,
+        code: -1000,
+        userInfo: [
+            NSLocalizedDescriptionKey: "Cannot load representation of type public.movie",
+            NSUnderlyingErrorKey: NSError(
+                domain: NSCocoaErrorDomain,
+                code: NSFileWriteOutOfSpaceError,
+                userInfo: [
+                    NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: 28)
+                ]),
+        ])
+
+    @Test("Details carry the index, domain, code and message")
+    func topLevel() {
+        let details = LoadFailure(index: 2, error: Self.outOfSpace).details
+        #expect(details["index"] as? Int == 2)
+        #expect(details["domain"] as? String == NSItemProvider.errorDomain)
+        #expect(details["code"] as? Int == -1000)
+        #expect(details["message"] as? String == "Cannot load representation of type public.movie")
+    }
+
+    @Test("Details list the underlying errors, outermost first")
+    func underlyingChain() {
+        let details = LoadFailure(index: 0, error: Self.outOfSpace).details
+        let underlying = details["underlying"] as? [[String: Any]] ?? []
+        #expect(underlying.count == 2)
+        #expect(underlying.first?["domain"] as? String == NSCocoaErrorDomain)
+        #expect(underlying.first?["code"] as? Int == NSFileWriteOutOfSpaceError)
+        #expect(underlying.last?["domain"] as? String == NSPOSIXErrorDomain)
+        #expect(underlying.last?["code"] as? Int == 28)
+    }
+
+    @Test("An error with nothing underneath has no underlying list")
+    func noUnderlying() {
+        let error = CocoaError(.fileReadNoSuchFile)
+        let details = LoadFailure(index: 0, error: error).details
+        #expect(details["domain"] as? String == NSCocoaErrorDomain)
+        #expect(details["code"] as? Int == CocoaError.fileReadNoSuchFile.rawValue)
+        #expect(details["underlying"] == nil)
+    }
+
+    @Test("A deep chain stops at the depth limit")
+    func depthLimit() {
+        var error = NSError(domain: "test", code: 0)
+        for code in 1...10 {
+            error = NSError(domain: "test", code: code, userInfo: [NSUnderlyingErrorKey: error])
+        }
+        let details = LoadFailure(index: 0, error: error).details
+        let underlying = details["underlying"] as? [[String: Any]] ?? []
+        #expect(underlying.count == LoadFailure.maxUnderlyingDepth)
+    }
+}
+
 @Suite("MediaRepresentation")
 struct MediaRepresentationTests {
     // A Live Photo registers its bundle first. Loading that would bring the
@@ -96,8 +154,8 @@ struct MediaRepresentationTests {
 }
 
 /// A picked item that loads `content` as `fileName` after `delay`, or fails
-/// when `content` is `nil`. Like iOS, it deletes the loaded file as soon as
-/// the completion handler returns.
+/// with `MockMediaItem.loadError` when `content` is `nil`. Like iOS, it
+/// deletes the loaded file as soon as the completion handler returns.
 final class MockMediaItem: PickedMediaItem {
     let assetIdentifier: String?
     let suggestedName: String?
@@ -106,6 +164,8 @@ final class MockMediaItem: PickedMediaItem {
     let content: String?
     let delay: TimeInterval
     private(set) var requestedTypes: [String] = []
+
+    static let loadError = NSError(domain: NSItemProvider.errorDomain, code: -1000)
 
     init(
         fileName: String,
@@ -125,14 +185,14 @@ final class MockMediaItem: PickedMediaItem {
 
     func loadFile(
         forTypeIdentifier typeIdentifier: String,
-        completion: @escaping (URL?) -> Void
+        completion: @escaping (URL?, Error?) -> Void
     ) {
         requestedTypes.append(typeIdentifier)
         let fileName = fileName
         let content = content
         DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
             guard let content else {
-                completion(nil)
+                completion(nil, Self.loadError)
                 return
             }
             let directory = FileManager.default.temporaryDirectory
@@ -141,7 +201,7 @@ final class MockMediaItem: PickedMediaItem {
             try? FileManager.default.createDirectory(
                 at: directory, withIntermediateDirectories: true)
             try? content.write(to: url, atomically: true, encoding: .utf8)
-            completion(url)
+            completion(url, nil)
             try? FileManager.default.removeItem(at: directory)
         }
     }
@@ -153,19 +213,26 @@ struct PickLoaderTests {
         temporaryDirectory: FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true))
 
-    func loadMedia(
+    func loadMediaWithFailures(
         _ items: [MockMediaItem],
         preferringCompatible: Bool = false
-    ) async -> [[String: Any]] {
+    ) async -> ([[String: Any]], [LoadFailure]) {
         await withCheckedContinuation { continuation in
             loader.loadMedia(
                 items,
                 preferringCompatible: preferringCompatible,
                 queue: .global()
-            ) { loaded in
-                continuation.resume(returning: loaded)
+            ) { loaded, failures in
+                continuation.resume(returning: (loaded, failures))
             }
         }
+    }
+
+    func loadMedia(
+        _ items: [MockMediaItem],
+        preferringCompatible: Bool = false
+    ) async -> [[String: Any]] {
+        await loadMediaWithFailures(items, preferringCompatible: preferringCompatible).0
     }
 
     func names(_ loaded: [[String: Any]]) -> [String] {
@@ -203,6 +270,19 @@ struct PickLoaderTests {
             return
         }
         #expect(items.count == 2)
+    }
+
+    // The errors reach Dart in the load_failed details (#2274).
+    @Test("Media that fails to load reports why, with its index")
+    func mediaFailures() async {
+        let (loaded, failures) = await loadMediaWithFailures([
+            MockMediaItem(fileName: "a.jpeg", content: "a"),
+            MockMediaItem(fileName: "b.jpeg", content: nil),
+            MockMediaItem(fileName: "c.jpeg", content: nil, delay: 0.1),
+        ])
+        #expect(loaded.count == 1)
+        #expect(failures.map(\.index).sorted() == [1, 2])
+        #expect(failures.allSatisfy { ($0.error as NSError) == MockMediaItem.loadError })
     }
 
     // Failing to load every item must not look like a cancellation (#2248).
@@ -265,9 +345,11 @@ struct PickLoaderTests {
         try "pdf".write(to: report, atomically: true, encoding: .utf8)
         let missing = source.appendingPathComponent("missing.pdf")
 
-        let loaded = loader.loadDocuments([report, missing])
+        let (loaded, failures) = loader.loadDocuments([report, missing])
 
         #expect(names(loaded) == ["report.pdf"])
+        #expect(failures.map(\.index) == [1])
+        #expect((failures.first?.error as? CocoaError)?.code == .fileNoSuchFile)
         #expect(!FileManager.default.fileExists(atPath: report.path))
         #expect(content(try #require(loaded.first)) == "pdf")
     }
